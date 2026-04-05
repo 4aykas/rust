@@ -1,5 +1,5 @@
 # ==============================================================================
-# Deploy-RustDesk.ps1  —  TEBIN IT / RustDesk Deploy
+# Deploy-RustDesk.ps1  — RustDesk Deploy
 # Run as Administrator:
 #   powershell -ExecutionPolicy Bypass -File Deploy-RustDesk.ps1
 # ==============================================================================
