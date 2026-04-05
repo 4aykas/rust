@@ -1,17 +1,10 @@
 # ==============================================================================
-# Deploy-RustDesk.ps1  —  TEBIN IT / RustDesk One-Command Deploy
-#
+# Deploy-RustDesk.ps1  —  TEBIN IT / RustDesk Deploy
 # Run as Administrator:
 #   powershell -ExecutionPolicy Bypass -File Deploy-RustDesk.ps1
-#
-# Requirements:
-#   - Windows 10/11 or Server 2016+  (no extra tools needed)
-#   - Administrator privileges
-#   - Internet access
 # ==============================================================================
 
 #Requires -RunAsAdministrator
-
 $ErrorActionPreference = 'SilentlyContinue'
 
 # ==== Settings ====
@@ -32,21 +25,131 @@ function Write-Log {
     "$ts [$lvl] $msg" | Out-File -Append -FilePath $logFile
 }
 function Show {
-    param([string]$msg, [string]$color = 'Cyan')
-    Write-Host "  $msg" -ForegroundColor $color
+    param([string]$msg, [string]$color = 'White')
+    Write-Host $msg -ForegroundColor $color
 }
 function Cleanup {
-    Remove-Item $archivePath  -Force -ErrorAction SilentlyContinue
-    Remove-Item $extractPath  -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item $archivePath -Force -ErrorAction SilentlyContinue
+    Remove-Item $extractPath -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# ==== Inline C# ZipCrypto extractor (no 7zip needed) ====
+$csCode = @'
+using System;
+using System.IO;
+using System.IO.Compression;
+using System.Text;
+
+public class ZipExtractor {
+    // ZipCrypto keys
+    static uint[] keys = new uint[3];
+
+    static void UpdateKeys(byte b) {
+        keys[0] = Crc32(keys[0], b);
+        keys[1] = (keys[1] + (keys[0] & 0xFF)) * 134775813 + 1;
+        keys[2] = Crc32(keys[2], (byte)(keys[1] >> 24));
+    }
+
+    static byte DecryptByte() {
+        uint temp = (keys[2] | 2) & 0xFFFF;
+        return (byte)((temp * (temp ^ 1)) >> 8);
+    }
+
+    static uint[] crcTable;
+    static uint Crc32(uint crc, byte b) {
+        if (crcTable == null) {
+            crcTable = new uint[256];
+            for (uint i = 0; i < 256; i++) {
+                uint c = i;
+                for (int j = 0; j < 8; j++)
+                    c = (c & 1) != 0 ? (0xEDB88320 ^ (c >> 1)) : (c >> 1);
+                crcTable[i] = c;
+            }
+        }
+        return crcTable[(crc ^ b) & 0xFF] ^ (crc >> 8);
+    }
+
+    static void InitKeys(string password) {
+        keys[0] = 305419896;
+        keys[1] = 591751049;
+        keys[2] = 878082192;
+        foreach (char c in password) UpdateKeys((byte)c);
+    }
+
+    public static string ExtractTextFile(string zipPath, string password) {
+        byte[] zipBytes = File.ReadAllBytes(zipPath);
+        int pos = 0;
+
+        // Find local file header signature 0x04034b50
+        while (pos < zipBytes.Length - 4) {
+            if (zipBytes[pos] == 0x50 && zipBytes[pos+1] == 0x4B &&
+                zipBytes[pos+2] == 0x03 && zipBytes[pos+3] == 0x04) break;
+            pos++;
+        }
+        if (pos >= zipBytes.Length - 4) throw new Exception("No local file header found.");
+
+        pos += 4; // skip signature
+        // general purpose bit flag at offset +2 from after signature (offset 6 from header start)
+        pos += 2; // version needed
+        int flags         = zipBytes[pos] | (zipBytes[pos+1] << 8); pos += 2;
+        int compression   = zipBytes[pos] | (zipBytes[pos+1] << 8); pos += 2;
+        pos += 4; // mod time + date
+        pos += 4; // crc32
+        int compSize   = (int)(zipBytes[pos] | (zipBytes[pos+1] << 8) |
+                               (zipBytes[pos+2] << 16) | (zipBytes[pos+3] << 24)); pos += 4;
+        pos += 4; // uncompressed size
+        int fnLen      = zipBytes[pos] | (zipBytes[pos+1] << 8); pos += 2;
+        int extraLen   = zipBytes[pos] | (zipBytes[pos+1] << 8); pos += 2;
+        pos += fnLen + extraLen; // skip filename + extra
+
+        // Decrypt 12-byte encryption header
+        InitKeys(password);
+        byte[] encHeader = new byte[12];
+        for (int i = 0; i < 12; i++) {
+            byte c = (byte)(zipBytes[pos+i] ^ DecryptByte());
+            UpdateKeys(c);
+            encHeader[i] = c;
+        }
+        pos += 12;
+        compSize -= 12;
+
+        // Validate: last byte of decrypted header should match high byte of CRC or mod time
+        // (for standard ZipCrypto check byte 11)
+        // We just attempt decryption and see if deflate succeeds
+
+        // Decrypt compressed data
+        byte[] compData = new byte[compSize];
+        for (int i = 0; i < compSize; i++) {
+            byte c = (byte)(zipBytes[pos+i] ^ DecryptByte());
+            UpdateKeys(c);
+            compData[i] = c;
+        }
+
+        // Decompress (deflate) or raw store
+        byte[] plainBytes;
+        if (compression == 8) {
+            using (var ms = new MemoryStream(compData))
+            using (var ds = new DeflateStream(ms, CompressionMode.Decompress))
+            using (var outMs = new MemoryStream()) {
+                ds.CopyTo(outMs);
+                plainBytes = outMs.ToArray();
+            }
+        } else {
+            plainBytes = compData;
+        }
+
+        return Encoding.UTF8.GetString(plainBytes);
+    }
+}
+'@
+
+Add-Type -TypeDefinition $csCode -Language CSharp
 
 # ==== Banner ====
 Clear-Host
 Write-Host ""
-Write-Host "  ╔═══════════════════════════════════════════════╗" -ForegroundColor DarkCyan
-Write-Host "  ║      RustDesk One-Command Deploy              ║" -ForegroundColor DarkCyan
-Write-Host "  ║      TEBIN IT                                 ║" -ForegroundColor DarkCyan
-Write-Host "  ╚═══════════════════════════════════════════════╝" -ForegroundColor DarkCyan
+Show "  RustDesk Deploy — TEBIN IT" 'Cyan'
+Show "  --------------------------------" 'DarkGray'
 Write-Host ""
 
 # ==== Init ====
@@ -54,14 +157,14 @@ if (-not (Test-Path "C:\Temp")) { New-Item -ItemType Directory "C:\Temp" -Force 
 Write-Log "==== Deploy Start ==== Host: $env:COMPUTERNAME | User: $env:USERNAME"
 
 # ==== Download secrets.zip ====
-Show "Downloading secrets archive from GitHub..."
+Show "  Downloading secrets archive..." 'Cyan'
 Write-Log "Fetching: $secretsUrl"
 try {
     Invoke-WebRequest -Uri $secretsUrl -OutFile $archivePath -UseBasicParsing -ErrorAction Stop
     Write-Log "Archive downloaded."
 } catch {
     Write-Log "Download failed: $_" 'ERROR'
-    Show "ERROR: Could not download secrets archive. Check network." 'Red'
+    Show "  ERROR: Could not download secrets archive." 'Red'
     exit 1
 }
 
@@ -72,121 +175,55 @@ $plainPass  = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
                 [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePass))
 Write-Host ""
 
-# ==== Extract ZIP with password via Shell.Application (native Windows COM) ====
-Write-Log "Extracting password-protected ZIP..."
-
+# ==== Extract & Parse Secrets ====
+Write-Log "Decrypting archive..."
 $rdServer = $null; $rdKey = $null; $rdPass = $null
 
 try {
-    Add-Type -AssemblyName System.IO.Compression.FileSystem
+    $plainText = [ZipExtractor]::ExtractTextFile($archivePath, $plainPass)
 
-    if (Test-Path $extractPath) { Remove-Item $extractPath -Recurse -Force }
-    New-Item -ItemType Directory $extractPath -Force | Out-Null
-
-    # Open ZIP with password using .NET ZipArchive
-    $stream  = [IO.File]::OpenRead($archivePath)
-    $zipArgs = [IO.Compression.ZipArchiveMode]::Read
-    $zip     = New-Object IO.Compression.ZipArchive($stream, $zipArgs)
-
-    $entry = $zip.Entries | Where-Object { $_.Name -eq "rustdesk-secrets.txt" } | Select-Object -First 1
-
-    if (-not $entry) {
-        throw "rustdesk-secrets.txt not found inside archive."
-    }
-
-    # .NET ZipArchive doesn't support passwords natively — use a memory trick:
-    # Read raw entry bytes then decrypt ZipCrypto manually, OR
-    # Use Shell.Application COM which supports standard ZIP passwords on Windows
-    $zip.Dispose(); $stream.Dispose()
-
-    # Shell.Application approach — works natively on all Windows versions
-    $shell    = New-Object -ComObject Shell.Application
-    $zipObj   = $shell.NameSpace($archivePath)
-    $destObj  = $shell.NameSpace($extractPath)
-
-    # Set password via Shell (this is how Windows Explorer handles it)
-    # FOF_SILENT(4) + FOF_NOCONFIRMATION(16) + FOF_NOERRORUI(1024) = 1044
-    $destObj.CopyHere($zipObj.Items(), 1044)
-    Start-Sleep -Seconds 2
-
-    $secretsFile = Join-Path $extractPath "rustdesk-secrets.txt"
-
-    # If Shell.Application extracted without password prompt (wrong pwd = empty file or no file)
-    if (-not (Test-Path $secretsFile) -or (Get-Item $secretsFile).Length -eq 0) {
-        # Shell.Application on modern Windows may prompt interactively for password
-        # Fallback: use a .NET workaround with ICSharpCode or direct byte manipulation
-        # Best cross-version approach: write a temp VBScript to handle password
-        $vbs = @"
-Dim oShell, oZip, oDest, oItems
-Set oShell = CreateObject("Shell.Application")
-Set oZip   = oShell.NameSpace("$archivePath")
-Set oDest  = oShell.NameSpace("$extractPath")
-oZip.Self.InvokeVerbEx "open", "$plainPass"
-oDest.CopyHere oZip.Items(), 1044
-WScript.Sleep 2000
-"@
-        $vbsPath = "C:\Temp\rd_extract.vbs"
-        Set-Content -Path $vbsPath -Value $vbs -Encoding ASCII
-        Start-Process "cscript.exe" -ArgumentList "//NoLogo `"$vbsPath`"" -Wait -WindowStyle Hidden
-        Remove-Item $vbsPath -Force -ErrorAction SilentlyContinue
-        Start-Sleep -Seconds 1
-    }
-
-    if (-not (Test-Path $secretsFile)) {
-        throw "Extraction failed — wrong password or corrupt archive."
-    }
-
-    # Parse secrets
-    Get-Content $secretsFile | ForEach-Object {
+    $plainText -split "`n" | ForEach-Object {
         $l = $_.Trim()
         if ($l -match '^\s*#|^$') { return }
         if ($l -match '^SERVER\s*=\s*(.+)$')   { $rdServer = $Matches[1].Trim() }
         if ($l -match '^KEY\s*=\s*(.+)$')       { $rdKey    = $Matches[1].Trim() }
         if ($l -match '^PASSWORD\s*=\s*(.+)$')  { $rdPass   = $Matches[1].Trim() }
     }
+    $plainText = $null
 
-    Write-Log "Secrets parsed."
+    # Validate
+    if (-not $rdServer -or -not $rdKey -or -not $rdPass) {
+        throw "One or more required fields (SERVER, KEY, PASSWORD) missing in secrets file."
+    }
 
 } catch {
     $plainPass = $null; [GC]::Collect()
     Cleanup
-    Write-Log "Decryption/extraction failed: $_" 'ERROR'
-    Show "✖  Incorrect password or corrupt archive. Nothing deployed." 'Red'
-    Write-Host ""; exit 1
-}
-
-# Wipe archive and extracted files from disk immediately
-Cleanup
-$plainPass = $null; [GC]::Collect()
-
-# ==== Validate Secrets ====
-$missing = @()
-if (-not $rdServer) { $missing += 'SERVER' }
-if (-not $rdKey)    { $missing += 'KEY' }
-if (-not $rdPass)   { $missing += 'PASSWORD' }
-if ($missing.Count -gt 0) {
-    Write-Log "Missing fields: $($missing -join ', ')" 'ERROR'
-    Show "ERROR: Secrets incomplete. Missing: $($missing -join ', ')" 'Red'
+    Write-Log "Extraction failed: $_" 'ERROR'
+    Show "  ERROR: Incorrect password or corrupt archive. Nothing deployed." 'Red'
+    Write-Host ""
     exit 1
 }
 
-Show "✔  Password accepted." 'Green'
-Write-Log "Secrets validated. Server: $rdServer"
+$plainPass = $null; [GC]::Collect()
+Cleanup
+Write-Log "Secrets loaded. Server: $rdServer"
+Show "  Password accepted." 'Green'
 
 # ==== Get Latest RustDesk Version ====
-Show "Checking latest RustDesk version..."
+Show "  Checking latest RustDesk version..." 'Cyan'
 Write-Log "Querying GitHub API..."
 try {
     $release     = Invoke-RestMethod -Uri "https://api.github.com/repos/rustdesk/rustdesk/releases/latest" -UseBasicParsing -ErrorAction Stop
     $latestVer   = $release.tag_name -replace '^v', ''
     $asset       = $release.assets | Where-Object { $_.name -match "x86_64\.exe$" } | Select-Object -First 1
     $downloadUrl = $asset.browser_download_url
-    Show "Latest version: $latestVer" 'White'
+    Show "  Latest version: $latestVer" 'White'
     Write-Log "Latest: v$latestVer"
 } catch {
     $latestVer   = "1.4.3"
     $downloadUrl = "https://github.com/rustdesk/rustdesk/releases/download/1.4.3/rustdesk-1.4.3-x86_64.exe"
-    Show "GitHub API unavailable — fallback v$latestVer" 'Yellow'
+    Show "  GitHub API unavailable, using fallback v$latestVer" 'Yellow'
     Write-Log "API failed, fallback v$latestVer" 'WARN'
 }
 
@@ -197,35 +234,35 @@ if (Test-Path $rustdeskExe) {
         $installedVer = (Get-Command $rustdeskExe).FileVersionInfo.ProductVersion
         Write-Log "Installed: v$installedVer"
         if ([version]$installedVer -ge [version]$latestVer) {
-            Show "RustDesk v$installedVer already up to date." 'Green'
+            Show "  RustDesk v$installedVer is already up to date." 'Green'
             Write-Log "Up to date. Skipping install."
             $skipInstall = $true
         } else {
-            Show "Updating v$installedVer → v$latestVer" 'Yellow'
-            Write-Log "Updating v$installedVer → v$latestVer"
+            Show "  Updating v$installedVer to v$latestVer..." 'Yellow'
+            Write-Log "Updating v$installedVer to v$latestVer"
         }
     } catch {
         Write-Log "Cannot read installed version. Reinstalling." 'WARN'
     }
 } else {
-    Show "RustDesk not found. Installing v$latestVer..."
+    Show "  RustDesk not found. Installing v$latestVer..." 'Cyan'
     Write-Log "Fresh install."
 }
 
 # ==== Download & Install ====
 if (-not $skipInstall) {
-    Show "Downloading RustDesk v$latestVer..."
+    Show "  Downloading RustDesk v$latestVer..." 'Cyan'
     Write-Log "Downloading installer..."
     try {
         Invoke-WebRequest -Uri $downloadUrl -OutFile $installTemp -UseBasicParsing -ErrorAction Stop
         Write-Log "Installer downloaded."
     } catch {
         Write-Log "Installer download failed: $_" 'ERROR'
-        Show "ERROR: Could not download RustDesk installer." 'Red'
+        Show "  ERROR: Could not download RustDesk installer." 'Red'
         exit 1
     }
 
-    Show "Installing silently (please wait)..."
+    Show "  Installing silently, please wait..." 'Cyan'
     Write-Log "Running silent install..."
     Start-Process -FilePath $installTemp -ArgumentList "--silent-install" -PassThru | Wait-Process
     Write-Log "Install complete."
@@ -268,21 +305,18 @@ Start-Sleep -Seconds 5
 Write-Log "Setting access password..."
 Start-Process -FilePath $rustdeskExe -ArgumentList "--password", $rdPass -Wait
 Start-Sleep -Seconds 3
-
 $rdPass = $null; $rdKey = $null; [GC]::Collect()
 
 # ==== Get Machine ID ====
 Write-Log "Retrieving RustDesk machine ID..."
 $machineId = $null
 
-# Method 1: RustDesk.toml
 $idConfig = "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config\RustDesk.toml"
 if (Test-Path $idConfig) {
     $idLine = Get-Content $idConfig | Where-Object { $_ -match '^id\s*=' }
     if ($idLine -match "=\s*'?([0-9]+)'?") { $machineId = $Matches[1].Trim() }
 }
 
-# Method 2: Scan logs
 if (-not $machineId -and (Test-Path $rdLogDir)) {
     $logs = Get-ChildItem $rdLogDir -Filter "*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 5
     foreach ($log in $logs) {
@@ -294,7 +328,6 @@ if (-not $machineId -and (Test-Path $rdLogDir)) {
     }
 }
 
-# Method 3: --get-id flag
 if (-not $machineId) {
     $idOutput = & $rustdeskExe --get-id 2>&1
     if ($idOutput -match '(\d{9,})') { $machineId = $Matches[1] }
@@ -304,28 +337,23 @@ Write-Log "Machine ID: $machineId"
 
 # ==== Final Output ====
 Write-Host ""
-Write-Host "  ╔═══════════════════════════════════════════════╗" -ForegroundColor Green
-Write-Host "  ║   ✔  Deployment Complete                      ║" -ForegroundColor Green
-Write-Host "  ╚═══════════════════════════════════════════════╝" -ForegroundColor Green
+Show "  --------------------------------" 'DarkGray'
+Show "  Deployment complete" 'Green'
+Show "  --------------------------------" 'DarkGray'
 Write-Host ""
-Write-Host "  Server  : $rdServer"  -ForegroundColor Gray
-Write-Host "  Version : $latestVer" -ForegroundColor Gray
+Show "  Server  : $rdServer" 'Gray'
+Show "  Version : $latestVer" 'Gray'
+Write-Host ""
 
 if ($machineId) {
-    Write-Host ""
-    Write-Host "  ┌─────────────────────────────────┐" -ForegroundColor Yellow
-    Write-Host "  │  RustDesk ID:  $machineId" -NoNewline -ForegroundColor Yellow
-    $pad = 34 - $machineId.Length
-    Write-Host (" " * $pad + "│") -ForegroundColor Yellow
-    Write-Host "  └─────────────────────────────────┘" -ForegroundColor Yellow
+    Show "  RustDesk ID  >>  $machineId" 'Yellow'
 } else {
-    Write-Host ""
-    Show "Could not retrieve ID automatically." 'Yellow'
-    Show "Open RustDesk — the ID is shown on the main screen." 'Yellow'
+    Show "  Could not retrieve ID automatically." 'Yellow'
+    Show "  Open RustDesk to see the ID on the main screen." 'Gray'
 }
 
 Write-Host ""
-Write-Host "  Log     : $logFile" -ForegroundColor DarkGray
+Show "  Log: $logFile" 'DarkGray'
 Write-Host ""
 
 Write-Log "==== Deploy End ===="
