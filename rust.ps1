@@ -16,7 +16,6 @@ $installTemp = "C:\Temp\rustdesk_setup.exe"
 $rustdeskExe = "C:\Program Files\RustDesk\rustdesk.exe"
 $userConfig  = "C:\Users\$env:USERNAME\AppData\Roaming\RustDesk\config\RustDesk2.toml"
 $svcConfig   = "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config\RustDesk2.toml"
-$rdLogDir    = "$env:APPDATA\RustDesk\log"
 
 # ==== Helpers ====
 function Write-Log {
@@ -268,7 +267,7 @@ if (-not $skipInstall) {
     Write-Log "Install complete."
     Start-Sleep -Seconds 5
 
-    Write-Log "Stopping RustDesk before config..."
+    Write-Log "Stopping RustDesk after install..."
     net stop rustdesk 2>&1 | Out-Null
     Get-Process rustdesk -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
     Start-Sleep -Seconds 2
@@ -289,14 +288,34 @@ direct-server = 'Y'
 direct-access-port = '21118'
 "@
 
-foreach ($cfgPath in @($userConfig, $svcConfig)) {
-    $dir = Split-Path $cfgPath
-    if (-not (Test-Path $dir)) { New-Item -ItemType Directory $dir -Force | Out-Null }
-    Set-Content -Path $cfgPath -Value $toml -Encoding UTF8
-    Write-Log "Config written: $cfgPath"
-}
+# Stop service before writing config regardless of install path
+Write-Log "Stopping RustDesk before config..."
+net stop rustdesk 2>&1 | Out-Null
+Get-Process rustdesk -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
 
-# ==== Start Service ====
+$utf8NoBom = New-Object System.Text.UTF8Encoding $false
+function Write-Config {
+    foreach ($cfgPath in @($userConfig, $svcConfig)) {
+        $dir = Split-Path $cfgPath
+        if (-not (Test-Path $dir)) { New-Item -ItemType Directory $dir -Force | Out-Null }
+        [System.IO.File]::WriteAllText($cfgPath, $toml, $utf8NoBom)
+        Write-Log "Config written: $cfgPath"
+    }
+}
+Write-Config
+
+# ==== Start Service (first run may overwrite config — restart to re-apply) ====
+Write-Log "Starting RustDesk service (first run)..."
+net start rustdesk 2>&1 | Out-Null
+Start-Sleep -Seconds 6
+
+Write-Log "Re-applying config after first-run init..."
+net stop rustdesk 2>&1 | Out-Null
+Get-Process rustdesk -ErrorAction SilentlyContinue | Stop-Process -Force -ErrorAction SilentlyContinue
+Start-Sleep -Seconds 2
+Write-Config
+
 Write-Log "Starting RustDesk service..."
 net start rustdesk 2>&1 | Out-Null
 Start-Sleep -Seconds 5
@@ -304,33 +323,47 @@ Start-Sleep -Seconds 5
 # ==== Apply Password ====
 Write-Log "Setting access password..."
 Start-Process -FilePath $rustdeskExe -ArgumentList "--password", $rdPass -Wait
-Start-Sleep -Seconds 3
 $rdPass = $null; $rdKey = $null; [GC]::Collect()
+
+# ==== Ensure service is running ====
+Write-Log "Starting RustDesk service (final)..."
+net start rustdesk 2>&1 | Out-Null
+Start-Sleep -Seconds 6
 
 # ==== Get Machine ID ====
 Write-Log "Retrieving RustDesk machine ID..."
 $machineId = $null
 
-$idConfig = "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config\RustDesk.toml"
-if (Test-Path $idConfig) {
-    $idLine = Get-Content $idConfig | Where-Object { $_ -match '^id\s*=' }
-    if ($idLine -match "=\s*'?([0-9]+)'?") { $machineId = $Matches[1].Trim() }
-}
+$idTomlPaths = @(
+    "C:\Windows\ServiceProfiles\LocalService\AppData\Roaming\RustDesk\config\RustDesk.toml",
+    "C:\Windows\System32\config\systemprofile\AppData\Roaming\RustDesk\config\RustDesk.toml",
+    "$env:APPDATA\RustDesk\config\RustDesk.toml"
+)
 
-if (-not $machineId -and (Test-Path $rdLogDir)) {
-    $logs = Get-ChildItem $rdLogDir -Filter "*.log" | Sort-Object LastWriteTime -Descending | Select-Object -First 5
-    foreach ($log in $logs) {
-        $match = Select-String -Path $log.FullName -Pattern "My\s+ID:\s*(\d+)" | Select-Object -Last 1
-        if ($match) {
-            $machineId = ($match.Line -replace '.*My\s+ID:\s*(\d+).*', '$1').Trim()
+# Retry up to 5 times — RustDesk may not have written the ID file immediately
+for ($attempt = 1; $attempt -le 5 -and -not $machineId; $attempt++) {
+    foreach ($idConfig in $idTomlPaths) {
+        if (-not (Test-Path $idConfig)) { continue }
+        $idLine = Get-Content $idConfig -ErrorAction SilentlyContinue |
+                  Where-Object { $_ -match '^id\s*=' } | Select-Object -First 1
+        if ($idLine -match "=\s*'?([A-Za-z0-9]{6,})'?") {
+            $machineId = $Matches[1].Trim()
+            Write-Log "ID found in $idConfig (attempt $attempt)"
             break
         }
     }
+    if (-not $machineId -and $attempt -lt 5) { Start-Sleep -Seconds 3 }
 }
 
 if (-not $machineId) {
-    $idOutput = & $rustdeskExe --get-id 2>&1
-    if ($idOutput -match '(\d{9,})') { $machineId = $Matches[1] }
+    $idTmp = "$env:TEMP\rd_getid.txt"
+    try {
+        Start-Process -FilePath $rustdeskExe -ArgumentList '--get-id' `
+            -RedirectStandardOutput $idTmp -WindowStyle Hidden -Wait -ErrorAction Stop
+        $idOut = (Get-Content $idTmp -ErrorAction SilentlyContinue) -join '' | ForEach-Object { $_.Trim() }
+        if ($idOut -match '([A-Za-z0-9]{6,})') { $machineId = $Matches[1] }
+    } catch {}
+    Remove-Item $idTmp -Force -ErrorAction SilentlyContinue
 }
 
 Write-Log "Machine ID: $machineId"
