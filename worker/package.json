@@ -1,0 +1,15 @@
+{
+  "name": "rd-config",
+  "version": "1.0.0",
+  "description": "Hands RustDesk server + key to rust.ps1 for a valid deploy token",
+  "scripts": {
+    "test": "vitest run",
+    "deploy": "wrangler deploy"
+  },
+  "type": "module",
+  "devDependencies": {
+    "vitest": "^5.1.0",
+    "wrangler": "^4.156.2"
+  },
+  "private": true
+}

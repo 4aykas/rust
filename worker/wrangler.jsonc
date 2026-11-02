@@ -1,0 +1,18 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "rd-config",
+  "main": "src/index.js",
+  // Same account as the tebin.pro zone (see the tebin site's wrangler.jsonc).
+  "account_id": "c76d64b4c2e4b789315fd17e268541d5",
+  "compatibility_date": "2026-10-15",
+  // Only the custom domain; no *.workers.dev or preview URLs.
+  "workers_dev": false,
+  "preview_urls": false,
+  "routes": [{ "pattern": "rd.tebin.pro", "custom_domain": true }],
+  // Per Cloudflare location and loose; a ceiling on noise, not the security boundary.
+  "ratelimits": [
+    { "name": "LIMITER", "namespace_id": "1001", "simple": { "limit": 10, "period": 60 } }
+  ],
+  "observability": { "enabled": true }
+  // Secrets (not in this file): RD_SERVER, RD_KEY, DEPLOY_TOKENS. See README.
+}
