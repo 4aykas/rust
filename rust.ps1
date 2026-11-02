@@ -273,10 +273,18 @@ function Invoke-Deploy {
         $p | Wait-Process -Timeout 300 -ErrorAction SilentlyContinue
         Remove-Item $installTemp -Force -ErrorAction SilentlyContinue
 
-        # The installer hands off to an elevated cmd; wait for the result, not the process.
-        for ($i = 0; $i -lt 60 -and -not (Get-Service rustdesk -ErrorAction SilentlyContinue); $i++) { Start-Sleep -Seconds 1 }
+        # The 1.5.x installer hands the copy to an elevated cmd and exits before
+        # rustdesk.exe is replaced, so wait for the new version (and the service),
+        # not for the installer process.
         $nowVer = $null
-        if (Test-Path $rustdeskExe) { $nowVer = ConvertTo-RustDeskVersion (Get-Item $rustdeskExe).VersionInfo.ProductVersion }
+        $deadline = (Get-Date).AddSeconds(120)
+        while ($true) {
+            $nowVer = $null
+            if (Test-Path $rustdeskExe) { $nowVer = ConvertTo-RustDeskVersion (Get-Item $rustdeskExe).VersionInfo.ProductVersion }
+            $updated = $nowVer -and (-not $wantVer -or $nowVer -ge $wantVer)
+            if (($updated -and (Get-Service rustdesk -ErrorAction SilentlyContinue)) -or (Get-Date) -gt $deadline) { break }
+            Start-Sleep -Seconds 2
+        }
         if (-not $nowVer) {
             Write-Log "rustdesk.exe not found after install." 'ERROR'
             Show "  ERROR: RustDesk installation failed." 'Red'
